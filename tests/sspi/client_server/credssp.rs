@@ -19,7 +19,7 @@ use super::kerberos::network_client::NetworkClientMock;
 use super::kerberos::{KrbEnvironment, init_krb_environment};
 use crate::client_server::TARGET_NAME;
 use crate::client_server::kerberos::kdc::SERVER_COMPUTER_NAME;
-use crate::common::CredentialsProxyImpl;
+use crate::common::{ByUsernameCredentialsProxy, CredentialsProxyImpl};
 
 const PUBLIC_KEY: &[u8] = &[
     48, 130, 2, 34, 48, 13, 6, 9, 42, 134, 72, 134, 247, 13, 1, 1, 1, 5, 0, 3, 130, 2, 15, 0, 48, 130, 2, 10, 2, 130,
@@ -46,12 +46,14 @@ const PUBLIC_KEY: &[u8] = &[
     71, 22, 137, 164, 4, 163, 206, 239, 57, 197, 112, 179, 191, 160, 5, 2, 3, 1, 0, 1,
 ];
 
-fn run_credssp(
+fn run_credssp<C>(
     client: &mut CredSspClient,
-    server: &mut CredSspServer<CredentialsProxyImpl<'_>>,
+    server: &mut CredSspServer<C>,
     auth_identity: &AuthIdentity,
     network_client: &mut dyn NetworkClient,
-) {
+) where
+    C: sspi::credssp::CredentialsProxy<AuthenticationData = AuthIdentity> + Send,
+{
     let mut ts_request = TsRequest::default();
 
     for _ in 0..4 {
@@ -107,6 +109,98 @@ fn credssp_ntlm() {
     let mut network_client = NetworkClientMock { kdc: KdcMock::empty() };
 
     run_credssp(&mut client, &mut server, &auth_identity, &mut network_client);
+}
+
+fn new_credssp_negotiate_client(auth_identity: &AuthIdentity) -> CredSspClient {
+    CredSspClient::new(
+        PUBLIC_KEY.to_vec(),
+        Credentials::AuthIdentity(auth_identity.clone()),
+        CredSspMode::WithCredentials,
+        ClientMode::Negotiate(NegotiateConfig::new(
+            Box::new(NtlmConfig {
+                client_computer_name: Some("DESKTOP-3D83IAN.example.com".to_owned()),
+            }),
+            Some("ntlm,!kerberos,!pku2u".to_owned()),
+            "DESKTOP-3D83IAN.example.com".to_owned(),
+        )),
+        TARGET_NAME.to_owned(),
+    )
+    .unwrap()
+}
+
+fn new_credssp_negotiate_server(
+    proxy: ByUsernameCredentialsProxy<'_>,
+) -> CredSspServer<ByUsernameCredentialsProxy<'_>> {
+    CredSspServer::new(
+        PUBLIC_KEY.to_vec(),
+        proxy,
+        ServerMode::Negotiate(NegotiateConfig::new(
+            Box::new(NtlmConfig {
+                client_computer_name: Some("DESKTOP-3D83IAN.example.com".to_owned()),
+            }),
+            Some("ntlm,!kerberos,!pku2u".to_owned()),
+            "SERVER.example.com".to_owned(),
+        )),
+    )
+    .unwrap()
+}
+
+/// A server with no seeded credentials authenticates an SPNEGO/NTLM client by
+/// resolving the identity from the client-supplied username mid-exchange.
+#[test]
+fn credssp_negotiate_ntlm_by_username() {
+    let auth_identity = AuthIdentity {
+        username: Username::parse("test_user").unwrap(),
+        password: Secret::from("test_password".to_owned()),
+    };
+
+    let mut client = new_credssp_negotiate_client(&auth_identity);
+    let mut server = new_credssp_negotiate_server(ByUsernameCredentialsProxy::new(&auth_identity));
+
+    let mut network_client = NetworkClientMock { kdc: KdcMock::empty() };
+
+    run_credssp(&mut client, &mut server, &auth_identity, &mut network_client);
+}
+
+/// By-username resolution must still reject a wrong password: the injected
+/// candidate fails `mechListMIC` verification instead of authenticating.
+#[test]
+fn credssp_negotiate_ntlm_by_username_wrong_password() {
+    let client_identity = AuthIdentity {
+        username: Username::parse("test_user").unwrap(),
+        password: Secret::from("test_password".to_owned()),
+    };
+    // The server resolves a different password for the same user.
+    let server_identity = AuthIdentity {
+        username: Username::parse("test_user").unwrap(),
+        password: Secret::from("wrong_password".to_owned()),
+    };
+
+    let mut client = new_credssp_negotiate_client(&client_identity);
+    let mut server = new_credssp_negotiate_server(ByUsernameCredentialsProxy::new(&server_identity));
+
+    let network_client = NetworkClientMock { kdc: KdcMock::empty() };
+
+    let mut ts_request = TsRequest::default();
+
+    for _ in 0..4 {
+        ts_request = match client
+            .process(mem::take(&mut ts_request))
+            .resolve_with_client(&network_client)
+            .unwrap()
+        {
+            ClientState::ReplyNeeded(ts_request) => ts_request,
+            ClientState::FinalMessage(ts_request) => ts_request,
+        };
+
+        match server.process(ts_request).resolve_with_client(&network_client) {
+            Ok(ServerState::ReplyNeeded(server_ts_request)) => ts_request = server_ts_request,
+            Ok(ServerState::Finished(_)) => panic!("authentication must not succeed with a wrong password"),
+            Err(_) => return,
+        };
+    }
+
+    panic!("CredSSP authentication should have failed within 4 steps")
 }
 
 #[test]

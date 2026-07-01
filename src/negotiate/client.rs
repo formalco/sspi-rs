@@ -288,6 +288,10 @@ pub(crate) async fn initialize_security_context<'a>(
                 expiry: None,
             })
         }
+        NegotiateState::AwaitingCredentials => Err(Error::new(
+            ErrorKind::OutOfSequence,
+            "AwaitingCredentials is a server-only state and must not occur on the client",
+        )),
         NegotiateState::Ok => Err(Error::new(
             ErrorKind::OutOfSequence,
             "initialize_security_context called after negotiation completed",

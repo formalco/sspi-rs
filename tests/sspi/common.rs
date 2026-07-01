@@ -39,6 +39,35 @@ impl credssp::CredentialsProxy for CredentialsProxyImpl<'_> {
     }
 }
 
+/// A [`credssp::CredentialsProxy`] that resolves credentials only by username:
+/// `auth_data` is empty, so the acceptor must pause and have candidates injected
+/// mid-exchange.
+pub(crate) struct ByUsernameCredentialsProxy<'a> {
+    credentials: &'a AuthIdentity,
+}
+
+impl<'a> ByUsernameCredentialsProxy<'a> {
+    pub(crate) fn new(credentials: &'a AuthIdentity) -> Self {
+        Self { credentials }
+    }
+}
+
+impl credssp::CredentialsProxy for ByUsernameCredentialsProxy<'_> {
+    type AuthenticationData = AuthIdentity;
+
+    fn auth_data_by_user(&mut self, username: &Username) -> io::Result<Self::AuthenticationData> {
+        if username.account_name() != self.credentials.username.account_name() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "unknown user"));
+        }
+
+        Ok(self.credentials.clone())
+    }
+
+    fn auth_data(&mut self) -> io::Result<Vec<Self::AuthenticationData>> {
+        Ok(Vec::new())
+    }
+}
+
 pub(crate) fn create_client_credentials_handle<T>(
     client: &mut T,
     auth_data: Option<&T::AuthenticationData>,

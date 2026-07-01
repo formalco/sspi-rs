@@ -185,6 +185,10 @@ enum NegotiateState {
     Initial,
     InProgress,
     VerifyMic,
+    /// The server read the client's username but has no candidate credentials
+    /// yet, and waits for the caller to inject them (via
+    /// [`SspiEx::custom_set_auth_identities`]) and re-drive the acceptor.
+    AwaitingCredentials,
     Ok,
 }
 
@@ -199,6 +203,28 @@ impl NegotiateMode {
     fn is_client(&self) -> bool {
         self == &NegotiateMode::Client
     }
+}
+
+/// SPNEGO fields captured when the acceptor pauses in
+/// [`NegotiateState::AwaitingCredentials`]. The inbound token is consumed during
+/// the paused step, so these are replayed on resume rather than re-parsed.
+#[derive(Clone, Debug, PartialEq)]
+enum PausedVerify {
+    /// Paused in [`NegotiateState::InProgress`].
+    InProgress {
+        neg_result: Vec<u8>,
+        mech_list_mic: Option<Vec<u8>>,
+    },
+    /// Paused in [`NegotiateState::VerifyMic`].
+    VerifyMic { mech_list_mic: Option<Vec<u8>> },
+}
+
+/// Outcome of selecting server-side candidate credentials for the wire username.
+enum CredentialStatus {
+    /// Candidates were found and fed into the inner mechanism.
+    Available,
+    /// No candidate is configured yet; the caller must resolve and inject them.
+    Needed,
 }
 
 #[derive(Clone, Debug)]
@@ -218,6 +244,8 @@ pub struct Negotiate {
     /// > if the accepted mechanism is the most preferred mechanism of both the initiator and the acceptor,
     /// > then the MIC token exchange is OPTIONAL.
     mic_needed: bool,
+    /// SPNEGO fields saved while paused in [`NegotiateState::AwaitingCredentials`].
+    paused_verify: Option<PausedVerify>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -295,6 +323,7 @@ impl Negotiate {
             mech_types: Default::default(),
             mic_verified: false,
             mic_needed: true,
+            paused_verify: None,
         })
     }
 
@@ -307,7 +336,13 @@ impl Negotiate {
         self.protocol.protocol_name()
     }
 
-    fn set_auth_identity(&mut self) -> Result<()> {
+    /// Feeds the statically configured candidate credentials for the
+    /// client-supplied username into the inner mechanism.
+    ///
+    /// Returns [`CredentialStatus::Needed`] when none are configured, so the
+    /// acceptor can pause and let the caller inject them via
+    /// [`SspiEx::custom_set_auth_identities`].
+    fn set_auth_identity(&mut self) -> Result<CredentialStatus> {
         let NegotiateMode::Server(auth_data) = &self.mode else {
             return Err(Error::new(
                 ErrorKind::InternalError,
@@ -339,13 +374,12 @@ impl Negotiate {
             .collect();
 
         if candidates.is_empty() {
-            return Err(Error::new(
-                ErrorKind::NoCredentials,
-                "user credentials are not found on the server side",
-            ));
+            return Ok(CredentialStatus::Needed);
         }
 
-        self.custom_set_auth_identities(candidates)
+        self.custom_set_auth_identities(candidates)?;
+
+        Ok(CredentialStatus::Available)
     }
 
     #[instrument(ret, level = "debug", fields(protocol = self.protocol.protocol_name()), skip_all)]

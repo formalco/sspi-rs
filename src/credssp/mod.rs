@@ -607,19 +607,51 @@ impl<C: CredentialsProxy<AuthenticationData = AuthIdentity> + Send> CredSspServe
                 let mut output_token = vec![SecurityBuffer::new(Vec::with_capacity(1024), BufferType::Token)];
 
                 let mut credentials_handle = self.credentials_handle.take();
-                let sspi_context = &mut self.context.as_mut().unwrap().sspi_context;
 
-                let builder = sspi_context
-                    .accept_security_context()
-                    .with_credentials_handle(&mut credentials_handle)
-                    .with_context_requirements(ServerRequestFlags::empty())
-                    .with_target_data_representation(DataRepresentation::Native)
-                    .with_input(&mut input_token)
-                    .with_output(&mut output_token);
-                match try_cred_ssp_server!(
-                    sspi_context.accept_security_context_impl(yield_point, builder).await,
-                    ts_request
-                ) {
+                let acsc_result = loop {
+                    let sspi_context = &mut self.context.as_mut().unwrap().sspi_context;
+
+                    let builder = sspi_context
+                        .accept_security_context()
+                        .with_credentials_handle(&mut credentials_handle)
+                        .with_context_requirements(ServerRequestFlags::empty())
+                        .with_target_data_representation(DataRepresentation::Native)
+                        .with_input(&mut input_token)
+                        .with_output(&mut output_token);
+                    let result = try_cred_ssp_server!(
+                        sspi_context.accept_security_context_impl(yield_point, builder).await,
+                        ts_request
+                    );
+
+                    // The `mechListMIC` cannot be verified without the password, so the acceptor
+                    // pauses once it has read the username. Resolve candidates by username, inject
+                    // them, and re-drive the acceptor to finish the exchange.
+                    if result.status != SecurityStatus::IncompleteCredentials {
+                        break result;
+                    }
+
+                    let ContextNames { username } = try_cred_ssp_server!(
+                        self.context.as_mut().unwrap().sspi_context.query_context_names(),
+                        ts_request
+                    );
+                    let candidates = try_cred_ssp_server!(
+                        self.credentials
+                            .auth_data_candidates_by_user(&username)
+                            .map_err(|e| Error::new(ErrorKind::LogonDenied, e.to_string())),
+                        ts_request
+                    );
+                    let cred_candidates = candidates.into_iter().map(Credentials::AuthIdentity).collect();
+                    try_cred_ssp_server!(
+                        self.context
+                            .as_mut()
+                            .unwrap()
+                            .sspi_context
+                            .custom_set_auth_identities(cred_candidates),
+                        ts_request
+                    );
+                };
+
+                match acsc_result {
                     AcceptSecurityContextResult {
                         status: SecurityStatus::ContinueNeeded,
                         ..

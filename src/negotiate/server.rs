@@ -7,7 +7,7 @@ use crate::builders::FilledAcceptSecurityContext;
 use crate::generator::YieldPointLocal;
 use crate::negotiate::extractors::{decode_initial_neg_init, negotiate_mech_type};
 use crate::negotiate::generators::{generate_final_neg_token_targ, generate_neg_token_targ, generate_neg_token_targ_1};
-use crate::negotiate::{GUEST_USERNAME, NegotiateState};
+use crate::negotiate::{CredentialStatus, GUEST_USERNAME, NegotiateState, PausedVerify};
 use crate::{
     AcceptSecurityContextResult, BufferType, ContextNames, Error, ErrorKind, Negotiate, NegotiatedProtocol, Result,
     SecurityBuffer, SecurityStatus, ServerRequestFlags, ServerResponseFlags, SspiImpl,
@@ -142,50 +142,42 @@ pub(crate) async fn accept_security_context(
                 input_token.buffer.clear();
             }
 
-            let mut result = negotiate
+            let result = negotiate
                 .protocol
                 .accept_security_context(yield_point, &mut builder)
                 .await?;
 
             if result.status == SecurityStatus::Ok || result.status == SecurityStatus::CompleteNeeded {
                 let mech_list_mic = mech_list_mic.0.map(|token| token.0.0);
+                let neg_accept_complete =
+                    neg_result.0.as_ref().map(|neg_result| neg_result.0.0.as_slice()) == Some(&ACCEPT_COMPLETE);
+
+                // Candidate credentials are needed to verify the `mechListMIC`. When none are
+                // configured, pause so the caller can inject them and re-drive the acceptor.
                 if mech_list_mic.is_some() && negotiate.mic_needed {
-                    negotiate.set_auth_identity()?;
-                    negotiate.verify_mic_token(mech_list_mic.as_deref())?;
+                    match negotiate.set_auth_identity()? {
+                        CredentialStatus::Available => {}
+                        CredentialStatus::Needed => {
+                            negotiate.paused_verify = Some(PausedVerify::InProgress {
+                                neg_result: if neg_accept_complete {
+                                    ACCEPT_COMPLETE.to_vec()
+                                } else {
+                                    Vec::new()
+                                },
+                                mech_list_mic,
+                            });
+                            negotiate.state = NegotiateState::AwaitingCredentials;
 
-                    negotiate.mic_verified = true;
-                }
-
-                if negotiate.mic_needed
-                    && mech_list_mic.is_none()
-                    && neg_result.0.as_ref().map(|neg_result| neg_result.0.0.as_slice()) == Some(&ACCEPT_COMPLETE)
-                {
-                    // We should skip `mechListMIC` exchange when the client tries guest logon.
-                    let ContextNames { username } = negotiate.protocol.query_context_names()?;
-
-                    if !username.inner().eq_ignore_ascii_case(GUEST_USERNAME) {
-                        return Err(Error::new(
-                            ErrorKind::InvalidToken,
-                            "the client skipped `mechListMIC` exchange, but it is required for non-guest logon",
-                        ));
+                            return Ok(AcceptSecurityContextResult {
+                                status: SecurityStatus::IncompleteCredentials,
+                                flags: ServerResponseFlags::empty(),
+                                expiry: None,
+                            });
+                        }
                     }
-
-                    negotiate.mic_needed = false;
                 }
 
-                let neg_result = if !negotiate.mic_needed || negotiate.mic_verified {
-                    negotiate.state = NegotiateState::Ok;
-                    result.status = SecurityStatus::Ok;
-
-                    ACCEPT_COMPLETE.to_vec()
-                } else {
-                    negotiate.state = NegotiateState::VerifyMic;
-                    result.status = SecurityStatus::ContinueNeeded;
-
-                    ACCEPT_INCOMPLETE.to_vec()
-                };
-
-                prepare_neg_token(neg_result, negotiate, &mut builder)?;
+                finish_in_progress(negotiate, &mut builder, neg_accept_complete, mech_list_mic.as_deref())?
             } else {
                 // Wrap in a NegToken.
                 let output_token = SecurityBuffer::find_buffer_mut(builder.output, BufferType::Token)?;
@@ -194,9 +186,9 @@ pub(crate) async fn accept_security_context(
                     picky_asn1_der::to_vec(&generate_neg_token_targ_1(Some(mem::take(&mut output_token.buffer))))?;
 
                 output_token.buffer = spnego_token;
-            }
 
-            result.status
+                result.status
+            }
         }
         NegotiateState::VerifyMic => {
             if !negotiate.mic_verified && negotiate.mic_needed {
@@ -209,19 +201,32 @@ pub(crate) async fn accept_security_context(
                 } = neg_token_targ.0;
 
                 let mech_list_mic = mech_list_mic.0.map(|token| token.0.0);
-                if mech_list_mic.is_some() {
-                    negotiate.set_auth_identity()?;
-                    negotiate.verify_mic_token(mech_list_mic.as_deref())?;
-                } else {
+                if mech_list_mic.is_none() {
                     return Err(Error::new(
                         ErrorKind::InvalidToken,
                         "mech_list_mic is not present in SPNEGO message",
                     ));
                 }
+
+                match negotiate.set_auth_identity()? {
+                    CredentialStatus::Available => {}
+                    CredentialStatus::Needed => {
+                        negotiate.paused_verify = Some(PausedVerify::VerifyMic { mech_list_mic });
+                        negotiate.state = NegotiateState::AwaitingCredentials;
+
+                        return Ok(AcceptSecurityContextResult {
+                            status: SecurityStatus::IncompleteCredentials,
+                            flags: ServerResponseFlags::empty(),
+                            expiry: None,
+                        });
+                    }
+                }
+                negotiate.verify_mic_token(mech_list_mic.as_deref())?;
             }
 
             SecurityStatus::Ok
         }
+        NegotiateState::AwaitingCredentials => resume_after_credentials(negotiate, &mut builder)?,
         NegotiateState::Ok => {
             return Err(Error::new(
                 ErrorKind::OutOfSequence,
@@ -267,4 +272,76 @@ fn prepare_neg_token(
     output_token.buffer = encoded_final_neg_token_targ;
 
     Ok(())
+}
+
+/// Verifies the `mechListMIC` (with the guest-logon exemption) and writes the
+/// SPNEGO response token, now that candidate credentials are available.
+fn finish_in_progress(
+    negotiate: &mut Negotiate,
+    builder: &mut FilledAcceptSecurityContext<'_, <Negotiate as SspiImpl>::CredentialsHandle>,
+    neg_accept_complete: bool,
+    mech_list_mic: Option<&[u8]>,
+) -> Result<SecurityStatus> {
+    if mech_list_mic.is_some() && negotiate.mic_needed {
+        negotiate.verify_mic_token(mech_list_mic)?;
+    }
+
+    if negotiate.mic_needed && mech_list_mic.is_none() && neg_accept_complete {
+        // We should skip `mechListMIC` exchange when the client tries guest logon.
+        let ContextNames { username } = negotiate.protocol.query_context_names()?;
+
+        if !username.inner().eq_ignore_ascii_case(GUEST_USERNAME) {
+            return Err(Error::new(
+                ErrorKind::InvalidToken,
+                "the client skipped `mechListMIC` exchange, but it is required for non-guest logon",
+            ));
+        }
+
+        negotiate.mic_needed = false;
+    }
+
+    let (neg_result, status) = if !negotiate.mic_needed || negotiate.mic_verified {
+        negotiate.state = NegotiateState::Ok;
+
+        (ACCEPT_COMPLETE.to_vec(), SecurityStatus::Ok)
+    } else {
+        negotiate.state = NegotiateState::VerifyMic;
+
+        (ACCEPT_INCOMPLETE.to_vec(), SecurityStatus::ContinueNeeded)
+    };
+
+    prepare_neg_token(neg_result, negotiate, builder)?;
+
+    Ok(status)
+}
+
+/// Resumes an acceptor paused in [`NegotiateState::AwaitingCredentials`], once
+/// the caller has injected credentials via [`SspiEx::custom_set_auth_identities`].
+/// Replays the SPNEGO fields captured before the pause to finish the step.
+fn resume_after_credentials(
+    negotiate: &mut Negotiate,
+    builder: &mut FilledAcceptSecurityContext<'_, <Negotiate as SspiImpl>::CredentialsHandle>,
+) -> Result<SecurityStatus> {
+    let paused = negotiate.paused_verify.take().ok_or_else(|| {
+        Error::new(
+            ErrorKind::OutOfSequence,
+            "resumed the acceptor without pending verify work",
+        )
+    })?;
+
+    match paused {
+        PausedVerify::InProgress {
+            neg_result,
+            mech_list_mic,
+        } => {
+            let neg_accept_complete = neg_result.as_slice() == ACCEPT_COMPLETE;
+
+            finish_in_progress(negotiate, builder, neg_accept_complete, mech_list_mic.as_deref())
+        }
+        PausedVerify::VerifyMic { mech_list_mic } => {
+            negotiate.verify_mic_token(mech_list_mic.as_deref())?;
+
+            Ok(SecurityStatus::Ok)
+        }
+    }
 }
